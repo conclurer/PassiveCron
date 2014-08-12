@@ -1,0 +1,487 @@
+<?php
+
+class PassiveCron extends WireData implements Module, ConfigurableModule
+{
+
+    public static function getModuleInfo()
+    {
+        return array(
+            'title' => 'PassiveCron / cron.pw',
+            'author' => 'Conclurer GbR',
+            'summary' => 'Runs tasks in the background using cron.pw',
+            'version' => '050',
+            'href' => 'https://cron.pw',
+            'autoload' => true,
+            'singular' => true
+        );
+    }
+
+    const cron_version = '0.5';
+    const service_url = 'https://cron.pw/';
+
+
+    public function init()
+    {
+
+    }
+
+    public function __construct()
+    {
+
+        $this->publicKey = null;
+        $this->accessToken = null;
+    }
+
+    public function __get($i)
+    {
+        if ($i == 'newTask') return $this->newTask();
+        else {
+            return parent::__get($i);
+        }
+    }
+
+    public function ___install()
+    {
+        if (!ini_get('allow_url_fopen')) {
+            throw new WireException("Your PHP has allow_url_fopen disabled, which is required by cron.pw.");
+        }
+
+        $this->publicKey = substr(str_shuffle("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"), 0, 32);
+        $this->save_configuration();
+
+        # Add database table
+        $sql = "CREATE TABLE `passive_cron` (
+  `id` varchar(24) NOT NULL DEFAULT '',
+  `module_name` varchar(255) DEFAULT NULL,
+  `method_name` varchar(255) DEFAULT NULL,
+  `repeating` int(1) unsigned DEFAULT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;";
+        try {
+            wire('db')->query($sql);
+        } catch (Exception $e) {
+            throw new WireException("Unable to create database table");
+        }
+
+        try {
+            file_put_contents(wire('config')->paths->root . 'cron_' . $this->publicKey . '.php', json_encode(array("successful" => true)));
+        } catch (Exception $e) {
+            $this->removeDatabaseTable();
+            throw new WireException("Unable to create site verification file");
+        }
+
+        try {
+            $result = $this->apiCall('/api/register_site', array('host_name' => $_SERVER['SERVER_NAME'], 'public_token' => $this->publicKey));
+            if ($result["error"]) {
+                throw new WireException($result['message']);
+            }
+            $this->accessToken = $result['access_token'];
+            $this->save_configuration();
+        } catch (WireException $e) {
+            $this->removeNodeFiles();
+            $this->removeDatabaseTable();
+            throw new WireException($e->getMessage());
+        } catch (Exception $e) {
+            $this->removeNodeFiles();
+            $this->removeDatabaseTable();
+            throw new WireException("Unable to register PassiveCron to cron.pw. Please reinstall PassiveCron to try again.");
+        }
+
+        try {
+            file_put_contents(wire('config')->paths->root . 'cron_' . $this->publicKey . '.php', '<?php require \'./index.php\'; $cron = wire(\'modules\')->get(\'PassiveCron\'); try {echo $cron->respondToCronRequest()->getResult();}catch(Wire404Exception $e) { header_remove(); header("HTTP/1.0 404 Not Found"); }');
+        } catch (Exception $e) {
+            $this->removeNodeFiles();
+            $this->removeDatabaseTable();
+            throw new WireException("Unable to create CronRequestHandler node file");
+        }
+
+    }
+
+    public function ___uninstall()
+    {
+        $this->removeNodeFiles();
+        $this->removeDatabaseTable();
+    }
+
+    /**
+     * Registers a module at cron.pw
+     * @param WireData $module
+     * @return bool
+     */
+    public function registerModule(WireData $module)
+    {
+        $className = get_class($module);
+        $moduleInfo = $className::getModuleInfo();
+        $moduleTitle = $moduleInfo['title'];
+        try {
+            $result = $this->apiCall('/api/register_module', array('access_token' => $this->accessToken, 'class_name' => $className));
+
+            if ($result['error']) {
+                $this->error("Module '$moduleTitle' could not be registered at cron.pw. An error occurred. Please try again later.");
+                return false;
+            }
+
+            if (!$result['result']) {
+                $auth_url = self::service_url . 'dashboard/login?domain=' . wire('config')->httpHost . "&access_token=" . $this->accessToken . '&target=/dashboard/authorize_module/' . $result['module_id'];
+                $this->error("<a href='javascript:window.open(\"$auth_url\", \"authorization_window\", \"toolbar=no,location=no,status=no,menubar=no,scrollbars=no,resizable=no,width=600,height=460\");' target='_blank'>Module '$moduleTitle' was added. Please click here to allow '$moduleTitle' to run background tasks.</a>");
+                return false;
+            } else {
+                $this->message("Module '$moduleTitle' was added to cron.pw and can now perform background tasks.");
+                return true;
+            }
+        } catch (Exception $e) {
+            return false;
+        }
+    }
+
+    /**
+     * Disables a module at cron.pw
+     * @param WireData $module
+     * @return bool
+     */
+    public function disableModule(WireData $module) {
+        $className = get_class($module);
+        $moduleInfo = $className::getModuleInfo();
+        $moduleTitle = $moduleInfo['title'];
+
+        try {
+            $result = $this->apiCall('/api/disable_module', array('access_token' => $this->accessToken, 'class_name' => $className));
+
+            if ($result['error']) {
+                $this->error("Module '$moduleTitle' could not be disabled at cron.pw. An error occurred.");
+                return false;
+            }
+
+            $this->message("Module '$moduleTitle' was successfully disabled at cron.pw.");
+            return true;
+        } catch (Exception $e) {
+            return false;
+        }
+    }
+
+    /**
+     * Adds a new task
+     * @return CronTimePoint
+     */
+    public function newTask()
+    {
+        return new CronTimePoint();
+    }
+
+    /**
+     * Registers the task at cron.pw
+     * @param CronTime $time
+     * @param WireData $module
+     * @param string $methodName
+     * @param array $parameters
+     * @return bool
+     */
+    public function registerTask(CronTime $time, WireData $module, $methodName, $parameters = array())
+    {
+        $moduleName = get_class($module);
+        try {
+            $result = $this->apiCall('/api/register_task', array('access_token' => $this->accessToken, 'class_name' => $moduleName, 'method_name' => $methodName, 'parameters' => $parameters, 'start_time' => $time->timestamp, 'interval' => get_class($time) == 'CronRepeatingTimePoint' ? $time->interval : null));
+
+            if ($result['error']) return false;
+
+            # Write to database table
+            $taskId = $result['task_id'];
+            $repeating = get_class($time) == 'CronRepeatingTimePoint' ? 1 : 0;
+
+            wire('db')->query("INSERT INTO `passive_cron` (`id`, `module_name`, `method_name`, `repeating`) VALUES ('$taskId', '$moduleName', '$methodName', $repeating)");
+
+            return $taskId;
+        } catch (Exception $e) {
+            return false;
+        }
+
+    }
+
+    private function removeNodeFiles()
+    {
+        $node_files = glob(wire('config')->paths->root . 'cron_*.php');
+        try {
+            foreach ($node_files as $file) {
+                unlink($file);
+            }
+        } catch (Exception $e) {
+            $this->error("Unable to remove CronRequestHandler node file. Please remove file by hand.");
+        }
+    }
+
+    private function removeDatabaseTable()
+    {
+        try {
+            wire('db')->query("DROP TABLE `passive_cron`");
+        } catch (Exception $e) {
+            $this->error("Unable to remove passive_cron database table. Please remove by hand.");
+        }
+    }
+
+    /**
+     * Processes an incoming request
+     * @return CronRequestExecution
+     * @throws Wire404Exception
+     */
+    public function respondToCronRequest()
+    {
+        // Return 404 if token is invalid
+        if ($_REQUEST['_token'] != $this->accessToken) throw new Wire404Exception();
+
+        $parameters = array();
+        foreach ($_REQUEST as $x => $y) {
+            if (substr($x, 0, 1) == '_') continue;
+            $parameters[$x] = $y;
+        }
+
+        $execution = new CronRequestExecution($_REQUEST['_task_id'], $_REQUEST['_target_class_name'], $_REQUEST['_target_method_name']);
+        $execution->execute($parameters);
+
+        return $execution;
+    }
+
+    /**
+     * Writes the configuration settings array
+     */
+    private function save_configuration()
+    {
+        wire('modules')->saveModuleConfigData($this, array(
+            'publicKey' => $this->publicKey,
+            'accessToken' => $this->accessToken
+        ));
+    }
+
+
+    public static function getModuleConfigInputFields(array $data)
+    {
+        $fields = new InputfieldWrapper();
+
+        $field = wire('modules')->get('InputfieldMarkup');
+        $field->columnWidth = 100;
+        $field->label = 'Manage your Background Tasks';
+        $field->description = 'Continue to your dashboard on cron.pw to manage your background tasks and inspect their results.';
+
+        $button = wire('modules')->get('InputfieldButton');
+        $button->value = 'Dashboard';
+        $button->href = self::service_url . 'dashboard/login?domain=' . wire('config')->httpHost . "&access_token=" . $data['accessToken'];
+        $field->add($button);
+
+        $fields->add($field);
+
+        return $fields;
+    }
+
+
+    /**
+     * Returns the stream context info array
+     * @param array $post_data
+     * @param bool $post
+     * @return array
+     */
+    private function generateStreamContextInfo($post_data = array(), $post = true)
+    {
+
+        $version = wire('config')->version;
+        $content = http_build_query($post_data);
+
+        return array(
+            'http' => array(
+                'method' => ($post) ? 'POST' : 'GET',
+                'header' => array(
+                    "Host: cron.pw",
+                    'Content-type: application/x-www-form-urlencoded',
+                    // Additional information for licence validating / quality improvement purposes
+                    // For privacy information, please read our terms and conditions.
+                    "Referer: " . $_SERVER['SERVER_NAME'] . "," . $_SERVER['SERVER_ADDR'],
+                    "User-Agent: ProcessWire/$version/" . self::cron_version
+                ),
+                'content' => $content
+            )
+        );
+    }
+
+    /**
+     * Performs a call to the minimize.pw API
+     * @param $node
+     * @param array $data
+     * @param bool $post
+     * @param bool $json
+     * @return mixed|string
+     */
+    private function apiCall($node, $data = array(), $post = true, $json = true)
+    {
+        $context = stream_context_create($this->generateStreamContextInfo($data, $post));
+
+        $result = file_get_contents(self::service_url . $node, false, $context);
+
+        if ($json) {
+            $result = json_decode($result, true);
+        }
+
+        return $result;
+    }
+
+}
+
+class CronRequestExecution
+{
+    private $module, $method_name, $module_name, $validAccess = false, $taskRecord = array();
+    private $response_code, $response_message, $response_data;
+
+    public function __construct($task_id, $module_name, $method_name)
+    {
+        # Verify task
+        $this->taskRecord = wire('db')->query("SELECT * FROM `passive_cron` WHERE id = '$task_id'")->fetch_array();
+        if ($this->taskRecord == null) throw new Wire404Exception();
+        if ($this->taskRecord['module_name'] != $module_name || $this->taskRecord['method_name'] != $method_name) throw new Wire404Exception();
+
+        $this->validAccess = true;
+        $this->module_name = $module_name;
+        $this->module = wire('modules')->get($module_name);
+        $this->method_name = $method_name;
+    }
+
+    public function execute($params = array())
+    {
+        if (!$this->validAccess) throw new Wire404Exception();
+
+        if ($this->module == null) $this->returnError('001', 'Requested module not found', array('requested_module' => $this->module_name, 'requested_method' => $this->method_name, 'parameters' => $params, 'request' => $_REQUEST));
+        elseif (!method_exists($this->module, $this->method_name)) $this->returnError('002', 'Requested method not found', array('requested_module' => $this->module_name, 'requested_method' => $this->method_name, 'parameters' => $params, 'request' => $_REQUEST));
+        else {
+            try {
+                $method = $this->method_name;
+                $this->module->$method($this, $params);
+            } catch (Exception $e) {
+                $this->returnError('000', 'Exception caught while execution', array('trace' => $e->getTraceAsString()));
+            }
+        }
+
+        if ($this->taskRecord['repeating'] == 0) {
+            try {
+                wire('db')->query("DELETE FROM `passive_cron` WHERE id = '" . $this->taskRecord['id'] . "'");
+            } catch (Exception $e) {
+            }
+        }
+    }
+
+    /**
+     * Returns a successful message to cron.pw
+     * @param string $code
+     * @param string $message
+     * @param array $data
+     */
+    public function returnSuccess($code, $message, $data = array())
+    {
+        $this->setReturnValues("8" . $code, $message, $data);
+    }
+
+    /**
+     * Returns a error message to cron.pw
+     * @param string $code
+     * @param string $message
+     * @param array $data
+     */
+    public function returnError($code, $message, $data = array())
+    {
+        $this->setReturnValues("9" . $code, $message, $data);
+    }
+
+    public function getResult()
+    {
+        return json_encode(array(
+            'code' => $this->response_code,
+            'message' => $this->response_message,
+            'data' => $this->response_data
+        ));
+    }
+
+    private function setReturnValues($code, $message, $data)
+    {
+        $this->response_code = $code;
+        $this->response_message = $message;
+        $this->response_data = $data;
+    }
+}
+
+abstract class CronTime
+{
+    public $timestamp;
+    public $interval;
+
+    /**
+     * Defines the module to be run at a certain time point
+     * @param WireData $module
+     * @param string $method_name
+     * @param array $parameters
+     * @return mixed
+     */
+    public function run(WireData $module, $method_name, $parameters = array())
+    {
+        return wire('modules')->get('PassiveCron')->registerTask($this, $module, $method_name, $parameters);
+    }
+}
+
+class CronTimePoint extends CronTime
+{
+
+    public function __construct($timestamp = null)
+    {
+        if ($timestamp == null) $timestamp = time();
+
+        while (!is_int($timestamp / 60)) {
+            $timestamp++;
+        }
+
+        $this->timestamp = $timestamp;
+    }
+
+    /**
+     * Creates a time point in the future
+     * @param int $amount
+     * @param string $uom
+     * @return CronTimePoint
+     */
+    public function in($amount, $uom)
+    {
+        $x = strtotime("+$amount $uom", $this->timestamp);
+        if (!$x) return $this;
+
+        return new CronTimePoint($x);
+    }
+
+    /**
+     * Creates a time point in the future
+     * @param string $uom
+     * @return CronTimePoint
+     */
+    public function next($uom)
+    {
+        $x = strtotime("next $uom", $this->timestamp);
+        if (!$x) return $this;
+
+        return new CronTimePoint($x);
+    }
+
+    /**
+     * Repeats the event
+     * @param int $amount
+     * @param string $uom
+     * @return CronRepeatingTimePoint
+     */
+    public function every($amount, $uom)
+    {
+        return new CronRepeatingTimePoint($this, $amount, $uom);
+    }
+}
+
+class CronRepeatingTimePoint extends CronTime
+{
+
+    public function __construct(CronTimePoint $timePoint, $amount, $uom)
+    {
+        if (!in_array($uom, array('minute', 'minutes', 'hour', 'hours', 'day', 'days', 'week', 'weeks', 'month', 'months', 'year', 'years'))) throw new WireException('Unknown unit of measure for time point');
+
+        $this->timestamp = $timePoint->timestamp;
+        $this->interval = "$amount $uom";
+    }
+}
